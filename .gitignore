@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.env
+
+# Project Specific
+.edgerc
+credentials.json
+*.xlsx
+# Keep example files if needed, but ignore real data
+domains.xlsx
+results.xlsx
+validation_results.xlsx
+*_debug_results.xlsx
+
+# OS
+.DS_Store
