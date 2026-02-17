@@ -18,6 +18,7 @@ domains.xlsx
 results.xlsx
 validation_results.xlsx
 *_debug_results.xlsx
+delete_results.xlsx
 
 # OS
 .DS_Store

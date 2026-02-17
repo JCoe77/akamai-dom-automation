@@ -39,7 +39,7 @@ def read_domains(file_path):
     Arguments:
         file_path (str): Path to the Excel file.
     Returns:
-        list: List of domain strings, normalized to lowercase.
+        list: List of dictionaries [{'domain': 'example.com', 'scope': 'DOMAIN'}]
     """
     try:
         df = pd.read_excel(file_path)
@@ -54,12 +54,73 @@ def read_domains(file_path):
             # Fallback to first column
             domains = df.iloc[:, 0].dropna().astype(str).str.strip().str.lower().tolist()
             
-        return domains
+        # Default scope to DOMAIN for file inputs
+        return [{'domain': d, 'scope': 'DOMAIN'} for d in domains]
     except Exception as e:
         print(f"[ERROR] Error reading Excel file: {e}")
         sys.exit(1)
 
-def check_validation_status(session, base_url, domain, account_switch_key=None):
+def fetch_all_domains(session, base_url, account_switch_key=None):
+    """
+    Fetches all domains from the Akamai API using pagination.
+    Returns:
+        list: List of dictionaries [{'domain': 'example.com', 'scope': '...'}]
+    """
+    endpoint = "/domain-validation/v1/domains"
+    url = urljoin(base_url, endpoint)
+    
+    domains_list = []
+    page = 1
+    page_size = 500 # Default/Max page size to minimize requests
+    
+    print("[INFO] Fetching all domains from Akamai API (Paginated)...")
+    
+    try:
+        while True:
+            params = {'page': page, 'pageSize': page_size}
+            if account_switch_key:
+                params['accountSwitchKey'] = account_switch_key
+            
+            print(f"[INFO] Fetching page {page}...")
+            response = session.get(url, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Check if 'domains' key exists and has items
+                current_batch = data.get('domains', [])
+                if not current_batch:
+                    break
+                    
+                for d in current_batch:
+                    # Filter domains immediately.
+                    # We ONLY want domains that are ready for validation (REQUEST_ACCEPTED, VALIDATION_IN_PROGRESS).
+                    # This drastically reduces memory usage and processing time for large accounts.
+                    d_status =  d.get('domainStatus', 'Unknown')
+                    if d_status in ['REQUEST_ACCEPTED', 'VALIDATION_IN_PROGRESS']:
+                        domains_list.append({
+                            'domain': d.get('domainName'),
+                            'scope': d.get('validationScope', 'DOMAIN'),
+                            'status': d_status
+                        })
+                
+                # If we received fewer items than page_size, we are on the last page
+                if len(current_batch) < page_size:
+                    break
+                    
+                page += 1
+            else:
+                print(f"[ERROR] Failed to fetch domains on page {page}: {response.status_code} - {response.text}")
+                # We stop fetching here to avoid infinite loops or partial data issues
+                break
+                
+        return domains_list
+            
+    except Exception as e:
+        print(f"[ERROR] Exception fetching domains: {e}")
+        sys.exit(1)
+
+def check_validation_status(session, base_url, domain, scope='DOMAIN', account_switch_key=None):
     """
     Checks the current domain status via GET request.
     Returns:
@@ -68,7 +129,7 @@ def check_validation_status(session, base_url, domain, account_switch_key=None):
     endpoint = f"/domain-validation/v1/domains/{domain}"
     url = urljoin(base_url, endpoint)
     
-    params = {'validationScope': 'DOMAIN'}
+    params = {'validationScope': scope}
     if account_switch_key:
         params['accountSwitchKey'] = account_switch_key
 
@@ -89,10 +150,10 @@ def check_validation_status(session, base_url, domain, account_switch_key=None):
     except Exception as e:
         return "Exception", "Exception", f"GET Exception: {str(e)}"
 
-def submit_validation_request(session, base_url, domain, account_switch_key=None):
+def submit_validation_request(session, base_url, domain, scope='DOMAIN', account_switch_key=None):
     """
     Submits a validation request for the given domain.
-    POST /domain-validation/v1/domains/validate-now
+    POST /domain-validation/v1/domains/validate-requests
     """
     endpoint = "/domain-validation/v1/domains/validate-now"
     url = urljoin(base_url, endpoint)
@@ -101,12 +162,12 @@ def submit_validation_request(session, base_url, domain, account_switch_key=None
     if account_switch_key:
         params['accountSwitchKey'] = account_switch_key
     
-    # Payload for validate-now
+    # Payload for validation request
     payload = {
         "domains": [
             {
                 "domainName": domain,
-                "validationScope": "DOMAIN",
+                "validationScope": scope,
                 "validationMethod": "DNS_TXT"
             }
         ]
@@ -139,54 +200,84 @@ def submit_validation_request(session, base_url, domain, account_switch_key=None
     except Exception as e:
         return "Exception", f"POST Exception: {str(e)}"
 
-def process_domains(input_file, output_file, edgerc_path, section, account_switch_key=None, delay=0):
+def process_domains(input_file, fetch_all, output_file, edgerc_path, section, account_switch_key=None, delay=0, limit=0):
     """
     Main processing function.
     """
-    print(f"[INFO] Reading domains from {input_file}...")
-    domains = read_domains(input_file)
-    print(f"[INFO] Found {len(domains)} domains.")
-    
     session, base_url = setup_authentication(edgerc_path, section)
     
+    domain_entries = []
+    
+    if fetch_all:
+        domain_entries = fetch_all_domains(session, base_url, account_switch_key)
+        print(f"[INFO] Fetched {len(domain_entries)} domains from API.")
+    elif input_file:
+        print(f"[INFO] Reading domains from {input_file}...")
+        domain_entries = read_domains(input_file)
+        print(f"[INFO] Found {len(domain_entries)} domains.")
+    else:
+        print("[ERROR] No input provided. Use --all or provide an input file.")
+        sys.exit(1)
+    
     results = []
+    submission_count = 0
     
     print("[INFO] Starting Validation Check & Submission...")
     if account_switch_key:
         print(f"[INFO] Using Account Switch Key: {account_switch_key}")
     if delay > 0:
         print(f"[INFO] Using delay of {delay} seconds between requests.")
+    if limit > 0:
+        print(f"[INFO] Submission limit set to: {limit}")
 
     try:
-        for i, domain in enumerate(domains):
-            print(f"[INFO] Processing {domain}...")
+        for i, entry in enumerate(domain_entries):
+            domain = entry['domain']
+            scope = entry['scope']
+            # Optimization: Use pre-fetched status if available
+            domain_status = entry.get('status')
             
-            # 1. GET Check
-            status, domain_status, msg = check_validation_status(session, base_url, domain, account_switch_key)
-            print(f"  -> Current Status: {domain_status}")
-            
+            # If status is unknown (e.g. from file input), fetch it
+            if not domain_status or domain_status == 'Unknown':
+                 _, domain_status, _ = check_validation_status(session, base_url, domain, scope, account_switch_key)
+
             # Logic: If REQUEST_ACCEPTED or VALIDATION_IN_PROGRESS -> Submit Validation
-            if domain_status in ['REQUEST_ACCEPTED', 'VALIDATION_IN_PROGRESS']:
-                print(f"  -> Triggering Validation Request...")
-                new_status, post_msg = submit_validation_request(session, base_url, domain, account_switch_key)
-                print(f"  -> Result: {new_status}")
+            # Filter condition
+            if domain_status not in ['REQUEST_ACCEPTED', 'VALIDATION_IN_PROGRESS']:
+                # Skip silently as requested
+                continue
+
+            print(f"[INFO] Processing {domain} (Scope: {scope})...")
+            print(f"  -> Current Status: {domain_status}")
+
+            # Check Limit
+            if limit > 0 and submission_count >= limit:
+                print(f"  -> Limit of {limit} reached. Skipping validation submission.")
                 results.append({
                     "Domain": domain,
+                    "Scope": scope,
+                    "Previous Status": domain_status,
+                    "Final Status": "Skipped (Limit Reached)",
+                    "Message": "Skipped validation submission due to --limit."
+                })
+            else:
+                print(f"  -> Triggering Validation Request...")
+                new_status, post_msg = submit_validation_request(session, base_url, domain, scope, account_switch_key)
+                print(f"  -> Result: {new_status}")
+                
+                if new_status not in ["Failed", "Exception"]: # Simple check, assumes non-error strings are success/attempts
+                    submission_count += 1
+                    
+                results.append({
+                    "Domain": domain,
+                    "Scope": scope,
                     "Previous Status": domain_status,
                     "Final Status": new_status,
                     "Message": post_msg
                 })
-            else:
-                print(f"  -> Skipping (Status not ready for validation).")
-                results.append({
-                    "Domain": domain,
-                    "Previous Status": domain_status,
-                    "Final Status": "Skipped",
-                    "Message": f"Skipped because status is {domain_status}."
-                })
             
             # Add delay if specified, but not after the last item
-            if delay > 0 and i < len(domains) - 1:
+            if delay > 0 and i < len(domain_entries) - 1:
                 time.sleep(delay)
 
     except KeyboardInterrupt:
@@ -209,13 +300,18 @@ def process_domains(input_file, output_file, edgerc_path, section, account_switc
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Akamai Domain Validation Trigger Script")
-    parser.add_argument("input_file", help="Path to the input Excel file containing domains")
+    parser.add_argument("input_file", nargs='?', help="Path to the input Excel file containing domains (optional if --all is used)")
+    parser.add_argument("--all", action="store_true", help="Fetch all domains from the API instead of using an input file")
     parser.add_argument("--output", "-o", default="validation_results.xlsx", help="Path to the output Excel file")
     parser.add_argument("--edgerc", "-e", default=os.path.expanduser("~/.edgerc"), help="Path to .edgerc file")
     parser.add_argument("--section", "-s", default="default", help="Section in .edgerc to use")
     parser.add_argument("--ask", help="Optional Account Switch Key")
     parser.add_argument("--delay", type=float, default=0, help="Optional delay in seconds")
+    parser.add_argument("--limit", type=int, default=0, help="Optional limit on number of validation submissions")
     
     args = parser.parse_args()
     
-    process_domains(args.input_file, args.output, args.edgerc, args.section, args.ask, args.delay)
+    if not args.input_file and not args.all:
+        parser.error("You must provide either an input_file or --all")
+    
+    process_domains(args.input_file, args.all, args.output, args.edgerc, args.section, args.ask, args.delay, args.limit)

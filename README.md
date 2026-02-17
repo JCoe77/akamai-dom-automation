@@ -71,15 +71,32 @@ The script generates an Excel file (default: `results.xlsx`) with the following 
 
 ## Domain Validation Trigger Script (`akamai_dom_validate.py`)
 
-This script is used to **submit** a validation check for domains that have already been created and have the TXT record in place.
+This script is used to **submit** a validation check for domains that have already been created and have a pending status (`REQUEST_ACCEPTED` or `VALIDATION_IN_PROGRESS`).
 
 ### Usage
 
+**Option 1: Validate specific domains from a file**
 ```bash
 python3 akamai_dom_validate.py domains.xlsx
 ```
 
+**Option 2: Validate ALL pending domains in your account**
+```bash
+# Process all eligible domains
+python3 akamai_dom_validate.py --all
+
+# Process a limited batch of eligible domains (e.g., first 50)
+python3 akamai_dom_validate.py --all --limit 50
+```
+
+### Key Features
+-   **Smart Filtering**: When using `--all`, the script fetches all domains but **automatically filters** the list to only include those with status `REQUEST_ACCEPTED` or `VALIDATION_IN_PROGRESS`. All other domains are silently ignored to speed up processing.
+-   **Performance Optimized**: Utilizes the initial list-fetch to determine status, avoiding redundant API calls for every domain.
+-   **Pagination Support**: Handles large accounts with thousands of domains automatically.
+
 ### Options
+-   `--all`: Fetch all domains from the Akamai account instead of using an input file.
+-   `--limit`: Stop submitting validation requests after a specified number of domains (e.g., `--limit 25`). Useful for testing or batched rollouts.
 -   `--output` or `-o`: Specify the output file name (default: `validation_results.xlsx`).
 -   `--edgerc` or `-e`: Specify a custom path to the `.edgerc` file (default: `~/.edgerc`).
 -   `--section` or `-s`: Specify the section in `.edgerc` to use (default: `default`).
@@ -87,11 +104,55 @@ python3 akamai_dom_validate.py domains.xlsx
 -   `--delay`: Optional delay in seconds between API calls to avoid rate limits.
 
 ### Output
-The script generates an Excel file (default: `validation_results.xlsx`) with the following columns:
+The script generates an Excel file (default: `validation_results.xlsx`) containing **only the domains that were processed** (i.e., eligible for validation).
+Columns:
 - **Domain**: The domain name processed.
-- **Previous Status**: The status retrieved via GET (e.g., `REQUEST_ACCEPTED`, `VALIDATED`).
+- **Scope**: The validation scope (e.g., `DOMAIN`, `DV_SAN`).
+- **Previous Status**: The status retrieved from the list (e.g., `REQUEST_ACCEPTED`).
 - **Final Status**: The result of the operation.
   - `Submitted`: "Validate Now" request successfully triggered.
-  - `Skipped`: Domain was not in a state to be validated.
+  - `Skipped (Limit Reached)`: Eligible domain was skipped because the `--limit` count was reached.
   - `Failed`: API error.
 - **Message**: Detailed message explaining the action taken.
+
+## Bulk Domain Deletion Script (`akamai_dom_delete.py`)
+
+This script performs a **bulk delete** of domains from the Domain Validation API. It is designed to be robust, handling batch errors intelligently.
+
+### Input File Format
+The script expects an Excel file with at least two columns:
+- **Domain**: The domain name to delete.
+- **validationScope**: The scope of the domain (e.g., `DOMAIN`, `DV_SAN`). **Required**.
+
+| Domain          | validationScope |
+|-----------------|-----------------|
+| example.com     | DOMAIN          |
+| sub.mysite.org  | DV_SAN          |
+
+### Usage
+
+```bash
+python3 akamai_dom_delete.py domains.xlsx
+```
+
+### Key Features
+- **Intelligent Error Handling**: APIs often reject an entire batch if even one domain is invalid (e.g., "Domain not found"). This script automatically:
+  1. Detects `400 Bad Request` batch failures.
+  2. Identifies exactly which domains were rejected by the API.
+  3. Records the specific error for the invalid domains.
+  4. **Automatically resubmits** the remaining valid domains from the batch.
+- **Batch Processing**: Deletes domains in batches (default 100) to respect API quotas.
+
+### Options
+-   `--output` or `-o`: Specify the output file name (default: `delete_results.xlsx`).
+-   `--edgerc` or `-e`: Specify a custom path to the `.edgerc` file (default: `~/.edgerc`).
+-   `--section` or `-s`: Specify the section in `.edgerc` to use (default: `default`).
+-   `--ask`: Optional Account Switch Key.
+-   `--batch-size`: Number of domains per batch delete request (default: `100`).
+
+### Output
+The script generates an Excel file (default: `delete_results.xlsx`) containing:
+- **Domain**: Domain name.
+- **Scope**: Validation scope.
+- **Result**: `Success` or `Failed`.
+- **Error Title/Detail**: Specific API error details (e.g., "Domain is not found") captured directly from the 400 response.
