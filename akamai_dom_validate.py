@@ -34,28 +34,62 @@ def setup_authentication(edgerc_path, section):
 
 def read_domains(file_path):
     """
-    Reads domains from an Excel file.
-    Assumes the first column contains the domains, or looks for a 'Domain' or 'Hostname' header.
-    Arguments:
-        file_path (str): Path to the Excel file.
-    Returns:
-        list: List of dictionaries [{'domain': 'example.com', 'scope': 'DOMAIN'}]
+    Reads domains and validationScope from an Excel file.
     """
     try:
         df = pd.read_excel(file_path)
         
-        # logic to find the domain column and normalize
-        # Normalization: lower() is critical to avoid API case-sensitivity issues
-        if 'Domain' in df.columns:
-            domains = df['Domain'].dropna().astype(str).str.strip().str.lower().tolist()
-        elif 'Hostname' in df.columns:
-            domains = df['Hostname'].dropna().astype(str).str.strip().str.lower().tolist()
-        else:
-            # Fallback to first column
-            domains = df.iloc[:, 0].dropna().astype(str).str.strip().str.lower().tolist()
+        # Normalize column names for flexible matching
+        df.columns = df.columns.astype(str).str.strip()
+        
+        # Identify Domain Column
+        domain_col_name = None
+        for col in df.columns:
+            if col.lower() in ['domain', 'hostname', 'domainname', 'domain name']:
+                domain_col_name = col
+                break
+        
+        # Fallback to first column if not found
+        if not domain_col_name:
+            domain_col_name = df.columns[0]
+            print(f"[WARN] Could not identify 'Domain' column. Using first column '{domain_col_name}' as domain.")
+
+        # Identify Scope Column
+        scope_col_name = None
+        for col in df.columns:
+            if col.lower() in ['validationscope', 'scope', 'validation scope']:
+                scope_col_name = col
+                break
+        
+        if not scope_col_name:
+             print(f"[WARN] 'Scope' column not found in {file_path}. Defaulting all to 'DOMAIN'.")
+
+        targets = []
+        for index, row in df.iterrows():
+            d = row[domain_col_name]
+            s = row[scope_col_name] if scope_col_name else "DOMAIN"
             
-        # Default scope to DOMAIN for file inputs
-        return [{'domain': d, 'scope': 'DOMAIN'} for d in domains]
+            # Simple validation
+            if pd.isna(d) or str(d).strip() == '':
+                continue
+                
+            d_str = str(d).strip().lower()
+            # Force uppercase for scope as API enums are usually uppercase (e.g. DOMAIN)
+            s_str = str(s).strip().upper() if not pd.isna(s) else "DOMAIN" 
+            
+            # Validate Scope value
+            if s_str not in ['DOMAIN', 'M_HOST', 'S_HOST']: # Add others if known, but these are standard
+                 # Warning or default? Let's just keep it. API will error if invalid.
+                 pass
+
+            targets.append({
+                "domainName": d_str,
+                "validationScope": s_str
+            })
+            
+        print(f"[INFO] Loaded {len(targets)} domains for validation from {file_path}")
+        return targets
+
     except Exception as e:
         print(f"[ERROR] Error reading Excel file: {e}")
         sys.exit(1)
@@ -120,41 +154,19 @@ def fetch_all_domains(session, base_url, account_switch_key=None):
         print(f"[ERROR] Exception fetching domains: {e}")
         sys.exit(1)
 
-def check_validation_status(session, base_url, domain, scope='DOMAIN', account_switch_key=None):
+def bulk_submit_validation(session, base_url, domains_batch, account_switch_key=None):
     """
-    Checks the current domain status via GET request.
-    Returns:
-        tuple: (Status_String (str), Domain_Status (str), Message (str))
-    """
-    endpoint = f"/domain-validation/v1/domains/{domain}"
-    url = urljoin(base_url, endpoint)
+    Submits a validation request for a batch of domains.
+    POST /domain-validation/v1/domains/validate-requests (or validate-now)
     
-    params = {'validationScope': scope}
-    if account_switch_key:
-        params['accountSwitchKey'] = account_switch_key
-
-    try:
-        response = session.get(url, params=params)
-        
-        if response.status_code == 200:
-            data = response.json()
-            status = data.get('status', 'Unknown')
-            domain_status = data.get('domainStatus', 'Unknown')
-            return status, domain_status, "Status retrieved successfully."
-            
-        elif response.status_code == 404:
-            return "Not Found", "Not Found", "Domain does not exist."
-        else:
-            return f"Error ({response.status_code})", f"Error ({response.status_code})", f"GET failed with status {response.status_code}"
-            
-    except Exception as e:
-        return "Exception", "Exception", f"GET Exception: {str(e)}"
-
-def submit_validation_request(session, base_url, domain, scope='DOMAIN', account_switch_key=None):
+    Handles 400 Bad Request errors by:
+    1. Parsing the 'errors' list to identify specific invalid domains.
+    2. Failing those specific domains.
+    3. Retrying the rest.
     """
-    Submits a validation request for the given domain.
-    POST /domain-validation/v1/domains/validate-requests
-    """
+    # Using the validate-now endpoint based on existing script. 
+    # User mentioned "validate-requests" in their prompt but the link was generic.
+    # The payload structure { "domains": [...] } is compatible with the bulk endpoints.
     endpoint = "/domain-validation/v1/domains/validate-now"
     url = urljoin(base_url, endpoint)
 
@@ -162,45 +174,178 @@ def submit_validation_request(session, base_url, domain, scope='DOMAIN', account
     if account_switch_key:
         params['accountSwitchKey'] = account_switch_key
     
-    # Payload for validation request
+    # Construct Payload
+    # The API expects: { "domains": [ { "domainName": "...", "validationScope": "..." }, ... ] }
+    # Our domains_batch already has these keys (from read_domains)
+    # We just need to ensure validationMethod is added if required, or defaults are fine.
+    # The previous script added "validationMethod": "DNS_TXT". We should probably keep that.
+    
+    payload_domains = []
+    for d in domains_batch:
+        payload_domains.append({
+            "domainName": d['domainName'],
+            "validationScope": d['validationScope'],
+            "validationMethod": "DNS_TXT" # Enforce DNS_TXT as per previous script
+        })
+
+    # Construct Payload
     payload = {
-        "domains": [
-            {
-                "domainName": domain,
-                "validationScope": scope,
-                "validationMethod": "DNS_TXT"
-            }
-        ]
+        "domains": payload_domains
     }
+    
+    results = []
     
     try:
         response = session.post(url, json=payload, params=params)
+        status_code = response.status_code
         
-        if response.status_code in (200, 201, 202, 207):
-             # Try to parse the domainStatus from the response
+        if status_code == 400:
+             print(f"[WARN] Batch failed with 400. Parsing errors...")
              try:
-                 data = response.json()
-                 # Handle simple response or list response
-                 if isinstance(data, dict):
-                     if 'domains' in data:
-                         for d in data['domains']:
-                             if d.get('domainName') == domain:
-                                 return d.get('domainStatus', 'Submitted'), "Validation request submitted."
-                     # Fallback check
-                     return data.get('domainStatus', 'Submitted'), "Validation request submitted."
-             except:
-                 pass
-             return "Submitted", "Validation request submitted (Status 2xx)."
-        
-        elif response.status_code == 400:
-             return "Failed (400)", f"Client Error: {response.text}"
+                 error_data = response.json()
+                 errors_list = error_data.get('errors', [])
+                 
+                 bad_indices = set()
+                 for err in errors_list:
+                     field = err.get('field', '')
+                     # Example: domains[0].domainName
+                     if field.startswith('domains[') and ']' in field:
+                         try:
+                             idx = int(field.split('[')[1].split(']')[0])
+                             bad_indices.add(idx)
+                         except:
+                             pass
+                 
+                 if not bad_indices:
+                     # Fail all if we can't pinpoint
+                     for d in domains_batch:
+                         results.append({
+                             "Domain": d['domainName'],
+                             "Scope": d['validationScope'],
+                             "Status Code": status_code,
+                             "Result": "Failed",
+                             "Error Title": error_data.get('title'),
+                             "Error Detail": error_data.get('detail'),
+                             "Details": f"Batch Error: {error_data.get('detail', 'Unknown Error')}"
+                         })
+                 else:
+                     retry_batch = []
+                     
+                     for i, d in enumerate(domains_batch):
+                         if i in bad_indices:
+                             # Find specific error
+                             specific_title = "Invalid Request"
+                             specific_detail = "Invalid Request"
+                             
+                             for err in errors_list:
+                                 if f"domains[{i}]" in err.get('field', ''):
+                                     specific_title = err.get('title', specific_title)
+                                     specific_detail = err.get('detail', specific_detail)
+                                     break
+                             
+                             results.append({
+                                 "Domain": d['domainName'],
+                                 "Scope": d['validationScope'],
+                                 "Status Code": status_code,
+                                 "Result": "Failed",
+                                 "Error Title": specific_title,
+                                 "Error Detail": specific_detail
+                             })
+                         else:
+                             retry_batch.append(d)
+                     
+                     if retry_batch:
+                         print(f"[INFO] Retrying {len(retry_batch)} valid domains...")
+                         retry_results = bulk_submit_validation(session, base_url, retry_batch, account_switch_key)
+                         results.extend(retry_results)
+                         
+             except Exception as e:
+                 print(f"[ERROR] Error parsing 400 response: {e}")
+                 for d in domains_batch:
+                     results.append({
+                             "Domain": d['domainName'],
+                             "Scope": d['validationScope'],
+                             "Status Code": status_code,
+                             "Result": "Failed",
+                             "Error Detail": f"Exception during retry logic: {e}"
+                         })
+
+        elif status_code in (200, 202):
+            # Success - Request processed
+            # Parse response to get individual domain statuses
+            try:
+                response_data = response.json()
+                resp_domains = response_data.get('domains', [])
+                
+                # Create a lookup for quick access: (domain, scope) -> status
+                # If scope is missing in response, fallback to just domain name
+                status_map = {}
+                for rd in resp_domains:
+                    d_name = rd.get('domainName')
+                    d_scope = rd.get('validationScope') # Might be None in response
+                    d_status = rd.get('domainStatus', 'Submitted')
+                    
+                    if d_name:
+                        if d_scope:
+                            status_map[(d_name, d_scope)] = d_status
+                        # Also map just by name as fallback
+                        if d_name not in status_map:
+                            status_map[d_name] = d_status
+                            
+                for d in domains_batch:
+                    # Try exact match first
+                    status = status_map.get((d['domainName'], d['validationScope']))
+                    if not status:
+                        # Fallback to name only
+                        status = status_map.get(d['domainName'], "Submitted")
+                        
+                    results.append({
+                        "Domain": d['domainName'],
+                        "Scope": d['validationScope'],
+                        "Status Code": status_code,
+                        "Result": "Submitted",
+                        "Details": f"Status: {status}",
+                        "Error Title": "",
+                        "Error Detail": ""
+                    })
+                    
+            except Exception as e:
+                # If JSON parse fails but status was 200, log as success but warn
+                print(f"[WARN] Failed to parse 200 response JSON: {e}")
+                for d in domains_batch:
+                    results.append({
+                        "Domain": d['domainName'],
+                        "Scope": d['validationScope'],
+                        "Status Code": status_code,
+                        "Result": "Submitted",
+                        "Details": "Request accepted (Response parsing failed)",
+                        "Error Title": "",
+                        "Error Detail": ""
+                    })
         else:
-             return f"Failed ({response.status_code})", f"API Error: {response.status_code}"
+             # Other errors
+             for d in domains_batch:
+                 results.append({
+                     "Domain": d['domainName'],
+                     "Scope": d['validationScope'],
+                     "Status Code": status_code,
+                     "Result": "Error",
+                     "Details": response.text
+                 })
 
     except Exception as e:
-        return "Exception", f"POST Exception: {str(e)}"
+        for d in domains_batch:
+            results.append({
+                "Domain": d['domainName'],
+                "Scope": d['validationScope'],
+                "Status Code": "Exception",
+                "Result": "Exception",
+                "Error Detail": str(e)
+            })
 
-def process_domains(input_file, fetch_all, output_file, edgerc_path, section, account_switch_key=None, delay=0, limit=0):
+    return results
+
+def process_domains(input_file, fetch_all, output_file, edgerc_path, section, account_switch_key=None, delay=0, limit=0, batch_size=50):
     """
     Main processing function.
     """
@@ -209,77 +354,51 @@ def process_domains(input_file, fetch_all, output_file, edgerc_path, section, ac
     domain_entries = []
     
     if fetch_all:
-        domain_entries = fetch_all_domains(session, base_url, account_switch_key)
+        # fetch_all_domains still returns list of dicts: {'domain': '...', 'scope': '...'}
+        # We need to normalize keys to match read_domains: 'domainName', 'validationScope'
+        raw_entries = fetch_all_domains(session, base_url, account_switch_key)
+        for entry in raw_entries:
+            domain_entries.append({
+                "domainName": entry.get('domain'),
+                "validationScope": entry.get('scope')
+            })
         print(f"[INFO] Fetched {len(domain_entries)} domains from API.")
     elif input_file:
         print(f"[INFO] Reading domains from {input_file}...")
         domain_entries = read_domains(input_file)
-        print(f"[INFO] Found {len(domain_entries)} domains.")
     else:
         print("[ERROR] No input provided. Use --all or provide an input file.")
         sys.exit(1)
     
-    results = []
-    submission_count = 0
+    all_results = []
     
-    print("[INFO] Starting Validation Check & Submission...")
+    print("[INFO] Starting Validation Submission (Bulk)...")
     if account_switch_key:
         print(f"[INFO] Using Account Switch Key: {account_switch_key}")
-    if delay > 0:
-        print(f"[INFO] Using delay of {delay} seconds between requests.")
     if limit > 0:
-        print(f"[INFO] Submission limit set to: {limit}")
+        print(f"[INFO] Limit set to: {limit} (Note: Batching might slightly exceed limit if not aligned)")
 
+    # Apply Limit if set
+    if limit > 0:
+        domain_entries = domain_entries[:limit]
+        print(f"[INFO] Processing limited to first {len(domain_entries)} domains.")
+
+    # Process in Batches
+    total = len(domain_entries)
+    
     try:
-        for i, entry in enumerate(domain_entries):
-            domain = entry['domain']
-            scope = entry['scope']
-            # Optimization: Use pre-fetched status if available
-            domain_status = entry.get('status')
+        for i in range(0, total, batch_size):
+            batch = domain_entries[i:i+batch_size]
+            print(f"[INFO] Processing batch {i//batch_size + 1} ({len(batch)} domains)...")
             
-            # If status is unknown (e.g. from file input), fetch it
-            if not domain_status or domain_status == 'Unknown':
-                 _, domain_status, _ = check_validation_status(session, base_url, domain, scope, account_switch_key)
-
-            # Logic: If REQUEST_ACCEPTED or VALIDATION_IN_PROGRESS -> Submit Validation
-            # Filter condition
-            if domain_status not in ['REQUEST_ACCEPTED', 'VALIDATION_IN_PROGRESS']:
-                # Skip silently as requested
-                continue
-
-            print(f"[INFO] Processing {domain} (Scope: {scope})...")
-            print(f"  -> Current Status: {domain_status}")
-
-            # Check Limit
-            if limit > 0 and submission_count >= limit:
-                print(f"  -> Limit of {limit} reached. Skipping validation submission.")
-                results.append({
-                    "Domain": domain,
-                    "Scope": scope,
-                    "Previous Status": domain_status,
-                    "Final Status": "Skipped (Limit Reached)",
-                    "Message": "Skipped validation submission due to --limit."
-                })
-            else:
-                print(f"  -> Triggering Validation Request...")
-                new_status, post_msg = submit_validation_request(session, base_url, domain, scope, account_switch_key)
-                print(f"  -> Result: {new_status}")
-                
-                if new_status not in ["Failed", "Exception"]: # Simple check, assumes non-error strings are success/attempts
-                    submission_count += 1
-                    
-                results.append({
-                    "Domain": domain,
-                    "Scope": scope,
-                    "Previous Status": domain_status,
-                    "Final Status": new_status,
-                    "Message": post_msg
-                })
+            # Submit Batch
+            batch_results = bulk_submit_validation(session, base_url, batch, account_switch_key)
+            all_results.extend(batch_results)
             
-            # Add delay if specified, but not after the last item
-            if delay > 0 and i < len(domain_entries) - 1:
+            # Delay
+            if delay > 0 and (i + batch_size < total):
                 time.sleep(delay)
-
+                
     except KeyboardInterrupt:
         print("\n[WARN] Script interrupted by user! Saving progress...")
     except Exception as e:
@@ -288,9 +407,8 @@ def process_domains(input_file, fetch_all, output_file, edgerc_path, section, ac
         # Safety Save
         print(f"[INFO] Writing results to {output_file}...")
         try:
-            if results:
-                results_df = pd.DataFrame(results)
-                # Reorder if desired, but default is fine
+            if all_results:
+                results_df = pd.DataFrame(all_results)
                 results_df.to_excel(output_file, index=False)
                 print("[INFO] Done.")
             else:
@@ -308,10 +426,11 @@ if __name__ == "__main__":
     parser.add_argument("--ask", help="Optional Account Switch Key")
     parser.add_argument("--delay", type=float, default=0, help="Optional delay in seconds")
     parser.add_argument("--limit", type=int, default=0, help="Optional limit on number of validation submissions")
+    parser.add_argument("--batch-size", type=int, default=50, help="Number of domains to submit in one request (Default: 50)")
     
     args = parser.parse_args()
     
     if not args.input_file and not args.all:
         parser.error("You must provide either an input_file or --all")
     
-    process_domains(args.input_file, args.all, args.output, args.edgerc, args.section, args.ask, args.delay, args.limit)
+    process_domains(args.input_file, args.all, args.output, args.edgerc, args.section, args.ask, args.delay, args.limit, args.batch_size)

@@ -156,3 +156,45 @@ The script generates an Excel file (default: `delete_results.xlsx`) containing:
 - **Scope**: Validation scope.
 - **Result**: `Success` or `Failed`.
 - **Error Title/Detail**: Specific API error details (e.g., "Domain is not found") captured directly from the 400 response.
+
+## Bulk Domain Invalidation Script (`akamai_dom_invalidate.py`)
+
+This script performs a **bulk invalidation** of domains via the Domain Validation API. When you invalidate a domain, Akamai doesn't recognize you as its owner. The domain is then automatically deleted as part of a cleanup procedure.
+
+### Input File Format
+The script expects an Excel file with at least two columns:
+- **Domain**: The domain name to invalidate.
+- **validationScope**: The scope of the domain (e.g., `DOMAIN`, `HOST`, `WILDCARD`). **Required**.
+
+| Domain          | validationScope |
+|-----------------|-----------------|
+| example.com     | DOMAIN          |
+| sub.mysite.org  | HOST            |
+
+### Usage
+
+```bash
+python3 akamai_dom_invalidate.py domains.xlsx
+```
+
+### Key Features
+- **Intelligent Error Handling**: Similar to the deletion script, this script automatically handles batch failures by:
+  1. Detects `400 Bad Request` batch failures.
+  2. Identifies specific invalid domains from the error response.
+  3. Records the specific error for those domains.
+  4. **Automatically resubmits** the valid domains from the batch.
+- **Batch Processing**: Invalidates domains in batches (default 100).
+
+### Options
+-   `--output` or `-o`: Specify the output file name (default: `invalidate_results.xlsx`).
+-   `--edgerc` or `-e`: Specify a custom path to the `.edgerc` file (default: `~/.edgerc`).
+-   `--section` or `-s`: Specify the section in `.edgerc` to use (default: `default`).
+-   `--ask`: Optional Account Switch Key.
+-   `--batch-size`: Number of domains per batch request (default: `100`).
+
+### Output
+The script generates an Excel file (default: `invalidate_results.xlsx`) containing:
+- **Domain**: Domain name.
+- **Scope**: Validation scope.
+- **Result**: `Success` or `Failed`.
+- **Error Title/Detail**: Specific API error details.
